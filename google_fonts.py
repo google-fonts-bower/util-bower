@@ -2,11 +2,9 @@
 
 Provides APIs to interact with font subsets, codepoints for font or subset.
 """
-
 import collections
 import contextlib
 import errno
-import json
 import os
 import re
 import sys
@@ -14,8 +12,10 @@ import sys
 
 from fontTools import ttLib
 
+import fonts_public_pb2 as fonts_pb2
+from google.protobuf import text_format
 import gflags as flags
-from google.apputils import resources
+from util import py_subsets
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('nam_dir', 'encodings/', 'nam file dir')
@@ -70,6 +70,14 @@ _FS_SELECTION_BITS = [
 ]
 
 
+# license_dir => license name mappings
+_KNOWN_LICENSE_DIRS = {
+    'apache': 'APACHE2',
+    'ofl': 'OFL',
+    'ufl': 'UFL',
+}
+
+
 FileFamilyStyleWeightTuple = collections.namedtuple(
     'FileFamilyStyleWeightTuple', ['file', 'family', 'style', 'weight'])
 
@@ -80,6 +88,8 @@ class Error(Exception):
 
 class ParseError(Error):
   """Exception used when parse failed."""
+
+
 
 
 def UnicodeCmapTables(font):
@@ -130,51 +140,48 @@ def RegularWeight(metadata):
   Raises:
     OSError: If regular file could not be found. errno.ENOENT.
   """
-  for f in metadata['fonts']:
-    if f['weight'] == 400 and f['style'] == 'normal':
-      return os.path.splitext(f['filename'])[0] + '.ttf'
-  raise OSError(errno.ENOENT, 'unable to find regular weight')
+  for f in metadata.fonts:
+    if f.weight == 400 and f.style == 'normal':
+      return os.path.splitext(f.filename)[0] + '.ttf'
+
+  name = '??'
+  if metadata.HasField('name'):
+    name = metadata.name
+  raise OSError(errno.ENOENT, 'unable to find regular weight in %s' % name)
 
 
 def ListSubsets():
-  """Returns a list of all subset names, in lowercase, except */all and menu."""
-
-  subsets = []
-
-  with resources.GetResourceAsFile(_SUBSET_RESOURCE_PATH) as f:
-    for l in f:
-      match = _SUBSET_PATTERN.search(l)
-      if match and match.group(1) not in ('ALL', 'MENU'):
-        subsets.append(match.group(2))
-
-  return subsets
+  """Returns a list of all subset names, in lowercase."""
+  return py_subsets.SUBSETS
 
 
 def Metadata(file_or_dir):
-  """Returns json object for a metadata file.
+  """Returns fonts_metadata.proto object for a metadata file.
 
-  If file_or_dir is a file named METADATA.json, load it. If file_or_dir is a
-  directory, load the METADATA.json file in that directory.
+  If file_or_dir is a file named METADATA.pb, load it. If file_or_dir is a
+  directory, load the METADATA.pb file in that directory.
 
   Args:
     file_or_dir: A file or directory.
   Returns:
-    Python object loaded from METADATA.json content.
+    Python object loaded from METADATA.pb content.
   Raises:
-    ValueError: if file_or_dir isn't a METADATA.json file or dir containing one.
+    ValueError: if file_or_dir isn't a METADATA.pb file or dir containing one.
   """
   if (os.path.isfile(file_or_dir) and
-      os.path.basename(file_or_dir) == 'METADATA.json'):
+      os.path.basename(file_or_dir) == 'METADATA.pb'):
     metadata_file = file_or_dir
   elif os.path.isdir(file_or_dir):
-    metadata_file = os.path.join(file_or_dir, 'METADATA.json')
+    metadata_file = os.path.join(file_or_dir, 'METADATA.pb')
   else:
-    raise ValueError('%s is neither METADATA.json file or a directory' %
+    raise ValueError('%s is neither METADATA.pb file or a directory' %
                      file_or_dir)
 
+  msg = fonts_pb2.FamilyProto()
   with open(metadata_file) as f:
-    # OrderedDict to avoid shuffling key order
-    return json.load(f, object_pairs_hook=collections.OrderedDict)
+    text_format.Merge(f.read(), msg)
+
+  return msg
 
 
 def CodepointsInSubset(subset, unique_glyphs=False):
@@ -279,13 +286,16 @@ def CodepointFiles(subset):
   return map(CodepointFileForSubset, files)
 
 
-def SubsetsInFont(file_path, min_pct):
+def SubsetsInFont(file_path, min_pct, ext_min_pct=None):
   """Finds all subsets for which we support > min_pct of codepoints.
 
   Args:
     file_path: A file_path to a font file.
     min_pct: Min percent coverage to report a subset. 0 means at least 1 glyph.
     25 means 25%.
+    ext_min_pct: The minimum percent coverage to report a -ext
+    subset supported. Used to admit extended subsets with a lower percent. Same
+    interpretation as min_pct. If None same as min_pct.
   Returns:
     A list of 3-tuples of (subset name, #supported, #in subset).
   """
@@ -303,7 +313,11 @@ def SubsetsInFont(file_path, min_pct):
 
     overlap = all_cps & subset_cps
 
-    if 100.0 * len(overlap) / len(subset_cps) > min_pct:
+    target_pct = min_pct
+    if ext_min_pct is not None and subset.endswith('-ext'):
+      target_pct = ext_min_pct
+
+    if 100.0 * len(overlap) / len(subset_cps) > target_pct:
       results.append((subset, len(overlap), len(subset_cps)))
 
   return results
@@ -360,32 +374,30 @@ def FileFamilyStyleWeight(filename):
 
 
 def ExtractNames(font, name_id):
-  results = []
-  for name in font['name'].names:
-    if name.nameID == name_id:
-      # name.string is weird. See fontTools/ttLib/tables/_n_a_m_e.py.
-      value = name.string
-      if name.isUnicode():
-        value = value.decode(name.getEncoding()).encode('utf8')
-      results.append(value)
-  return results
+  return [n.string.decode(n.getEncoding()).encode('ascii', 'ignore')
+          for n in font['name'].names if n.nameID == name_id]
 
 
-def ExtractName(fontfile, name_id, default):
+def ExtractName(font_or_file, name_id, default):
   """Extracts a name table field (first value if many) from a font.
 
   Args:
-    fontfile: path to a font file.
+    font_or_file: path to a font file or a TTFont.
     name_id: the ID of the name desired. Use NAME_* constant.
     default: result if no value is present.
   Returns:
     The value of the first entry for name_id or default if there isn't one.
   """
   value = default
-  with contextlib.closing(ttLib.TTFont(fontfile)) as font:
-    names = ExtractNames(font, name_id)
-    if names:
-      value = names[0]
+  names = []
+  if type(font_or_file) is ttLib.TTFont:
+    names = ExtractNames(font_or_file, name_id)
+  else:
+    with contextlib.closing(ttLib.TTFont(font_or_file)) as font:
+      names = ExtractNames(font, name_id)
+
+  if names:
+    value = names[0]
 
   return value
 
@@ -446,15 +458,15 @@ def FullnameFor(family, style, weight):
 
 
 def FontDirs(path):
-  """Finds all the font directories (based on METADATA.json) under path.
+  """Finds all the font directories (based on METADATA.pb) under path.
 
   Args:
     path: A path to search under.
   Yields:
-    Directories under path that have a METADATA.json.
+    Directories under path that have a METADATA.pb.
   """
   for dir_name, _, _ in os.walk(path):
-    if os.path.isfile(os.path.join(dir_name, 'METADATA.json')):
+    if os.path.isfile(os.path.join(dir_name, 'METADATA.pb')):
       yield dir_name
 
 
@@ -489,3 +501,30 @@ def FsSelectionFlags(fs_selection):
     if fs_selection & mask:
       names.append(name)
   return names
+
+
+def _EntryForEndOfPath(path, answer_map):
+  segments = [s.lower() for s in path.split(os.sep)]
+  answers = [answer_map[s] for s in segments
+             if s in answer_map]
+  if len(answers) != 1:
+    raise ValueError('Found %d possible matches: %s' % (
+        len(answers), answers))
+  return answers[0]
+
+
+def LicenseFromPath(path):
+  """Try to figure out the license for a given path.
+
+  Splits path and looks for known license dirs in segments.
+
+  Args:
+    path: A filesystem path, hopefully including a license dir.
+  Returns:
+    The name of the license, eg OFL, UFL, etc.
+  Raises:
+    ValueError: if 0 or >1 licenses match path.
+  """
+  return _EntryForEndOfPath(path, _KNOWN_LICENSE_DIRS)
+
+
